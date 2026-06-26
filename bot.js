@@ -110,7 +110,8 @@ async function callClaude(prompt, maxTokens) {
   if (!r.ok) throw new Error((d.error && d.error.message) || "Ошибка Anthropic API");
   return (d.content && d.content[0] && d.content[0].text) || "";
 }
-function parseJson(text) { const a = text.indexOf("{"), b = text.lastIndexOf("}"); return JSON.parse(text.slice(a, b + 1)); }
+function parseJson(text) { let t = String(text).trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim(); const a = t.indexOf("{"), b = t.lastIndexOf("}"); if (a < 0 || b < 0) throw new Error("нет JSON в ответе"); return JSON.parse(t.slice(a, b + 1)); }
+const sval = x => typeof x === "number" ? x : (x && typeof x.s === "number" ? x.s : 0);
 
 const ROP_METHOD =
   "СТИЛЬ РАЗБОРА (как у РОПа Finpark): критикуй прямо, по делу и доказательно — опираясь на конкретные реплики и пропуски в ЭТОМ диалоге, без общих фраз. " +
@@ -126,21 +127,29 @@ const ROP_METHOD =
   "(9) Всё взаимосвязано: слабый старт бьёт в финале. Мышление — чистая прибыль, не оборот. ";
 
 async function evaluateText(transcript) {
-  const prompt =
+  const tx = transcript.slice(0, 55000);
+  const rich =
     "Ты — РОП (руководитель отдела продаж) Finpark. Разбери ТЕКСТ ДИАГНОСТИКИ как наставник партнёра-франчайзи, строго по чек-листу. " + ROP_METHOD +
-    "\nЗадачи: 1) Для КАЖДОГО пункта чек-листа поставь балл 0/1/2 (2 — выполнено полно, 1 — частично, 0 — нет/отсутствует), оценивая ТОЛЬКО по фактам из текста. " +
-    "2) По КАЖДОМУ из 8 этапов вскрой КОНКРЕТНЫЕ ошибки (с привязкой к реальным репликам/пропускам этого диалога) и дай «как надо было» — с примером точной формулировки или вопроса. " +
-    "3) Дай 3 сильные стороны и короткое резюме-вердикт.\n\nКРИТЕРИИ (этапы и пункты):\n" + CRITERIA +
-    "\n\nТЕКСТ ДИАГНОСТИКИ:\n" + transcript.slice(0, 60000) +
-    '\n\nВерни СТРОГО валидный JSON без markdown: {"scores":{"1.1":{"s":2,"n":"кратко"}, ...все коды...},"stages":{"1":{"mistakes":["конкретная ошибка по факту диалога"],"howto":["что и как сделать + пример фразы/вопроса"]}, ..."8":{...}},"strengths":["..","..",".."],"summary":"вердикт"}';
-  return parseJson(await callClaude(prompt, 6000));
+    "\nЗадачи: 1) Для КАЖДОГО пункта чек-листа поставь балл 0/1/2 (2 — полно, 1 — частично, 0 — нет/отсутствует), ТОЛЬКО по фактам из текста. " +
+    "2) По КАЖДОМУ из 8 этапов: до 2 КОНКРЕТНЫХ ошибок (по реальным репликам/пропускам диалога, коротко) и до 2 «как надо было» (с примером формулировки/вопроса, коротко). " +
+    "3) Дай 3 сильные стороны и короткий вердикт.\n\nКРИТЕРИИ:\n" + CRITERIA +
+    "\n\nТЕКСТ ДИАГНОСТИКИ:\n" + tx +
+    '\n\nВерни СТРОГО валидный JSON без markdown и без лишнего текста. Баллы — числами. Формат: {"scores":{"1.1":2,"1.2":1, ...все коды...},"stages":{"1":{"mistakes":["..."],"howto":["..."]}, ..."8":{...}},"strengths":["..","..",".."],"summary":"вердикт"}';
+  try { return parseJson(await callClaude(rich, 8000)); }
+  catch (e) {
+    const lite =
+      "Оцени ТЕКСТ ДИАГНОСТИКИ по чек-листу Finpark. Для каждого пункта балл 0/1/2 по фактам из текста. Дай 3 сильные стороны и короткий вердикт.\n\nКРИТЕРИИ:\n" + CRITERIA +
+      "\n\nТЕКСТ:\n" + tx +
+      '\n\nВерни СТРОГО JSON без markdown: {"scores":{"1.1":2, ...все коды...},"strengths":["..","..",".."],"summary":".."}';
+    return parseJson(await callClaude(lite, 3000));
+  }
 }
 
 function buildReport(p) {
   const sc = p.scores || {}; let itog = 0; const stages = [];
   for (const s of RUBRIC) {
     let sum = 0;
-    for (const it of s.items) { let v = sc[it.c] && typeof sc[it.c].s === "number" ? sc[it.c].s : 0; v = Math.max(0, Math.min(2, Math.round(v))); sum += v; }
+    for (const it of s.items) { sum += Math.max(0, Math.min(2, Math.round(sval(sc[it.c])))); }
     const pct = sum / (s.items.length * 2); itog += pct * (s.weight / 100);
     stages.push({ code: s.code, name: s.name, weight: s.weight, pct });
   }
@@ -345,7 +354,7 @@ function buildEvalPdf(p) {
     const stLine = s => { ensure(16); const y = doc.y; doc.font("B").fillColor(colOf(s.pct)).fontSize(11).text("●", M, y, { width: 12 }); doc.font("R").fillColor("#222222").fontSize(10.5).text("Этап " + s.code + ". " + s.name + " — " + Math.round(s.pct * 100) + "% (вес " + s.weight + "%)", M + 16, y, { width: CW - 16 }); };
 
     const sc = p.scores || {}; let itog = 0; const stages = [];
-    for (const s of RUBRIC) { let sum = 0; for (const it of s.items) { let v = sc[it.c] && typeof sc[it.c].s === "number" ? sc[it.c].s : 0; v = Math.max(0, Math.min(2, Math.round(v))); sum += v; } const pct = sum / (s.items.length * 2); itog += pct * (s.weight / 100); stages.push({ code: s.code, name: s.name, weight: s.weight, pct }); }
+    for (const s of RUBRIC) { let sum = 0; for (const it of s.items) { sum += Math.max(0, Math.min(2, Math.round(sval(sc[it.c])))); } const pct = sum / (s.items.length * 2); itog += pct * (s.weight / 100); stages.push({ code: s.code, name: s.name, weight: s.weight, pct }); }
     const stat = itog >= 0.9 ? "Эталон" : itog >= 0.75 ? "Хорошо" : itog >= 0.5 ? "Рабочий уровень" : "Критично";
 
     doc.rect(0, 0, PW, doc.page.height).fill(NAVY);
