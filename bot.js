@@ -1,15 +1,17 @@
-// Finpark — Telegram-бот: оценка диагностик + генерация КП (презентация) и договора.
+// Finpark — Telegram-бот: оценка диагностик + «Результаты диагностики» (PDF) + договор (DOCX).
 // Принимает текст, ссылку (вкл. Google Docs) и файл .docx/.txt.
 // Переменные окружения: BOT_TOKEN, ANTHROPIC_API_KEY (обязательны); ACCESS_CODE, MODEL (необязательны).
 const fs = require("fs");
 const path = require("path");
 const mammoth = require("mammoth");
-const PptxGenJS = require("pptxgenjs");
+const PDFDocument = require("pdfkit");
 const { Document, Packer, Paragraph, TextRun, AlignmentType } = require("docx");
 
 const DATA = JSON.parse(fs.readFileSync(path.join(__dirname, "rubric_data.json"), "utf8"));
 const RUBRIC = DATA.RUBRIC, TIPS = DATA.TIPS;
 const CONTRACT_TEMPLATE = fs.readFileSync(path.join(__dirname, "contract_template.txt"), "utf8");
+const FONT_R = path.join(__dirname, "DejaVuSans.ttf");
+const FONT_B = path.join(__dirname, "DejaVuSans-Bold.ttf");
 const CRITERIA = RUBRIC.map(s => "ЭТАП " + s.code + " — " + s.name + ":\n" +
   s.items.map(i => "  " + i.c + " " + i.t + ": " + i.d + " (эталон: " + i.grn + ")").join("\n")).join("\n");
 
@@ -25,7 +27,7 @@ const allowed = new Set();
 const state = {};
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const NAVY = "1F3864", BLUE = "2E75B6", GREYT = "595959", LIGHT = "EAF0FA", GOLD = "BF8F00";
+const NAVY = "#1F3864", BLUE = "#2E75B6", GREYT = "#595959", LIGHT = "#EAF0FA", GREEN = "#548235";
 
 let franchiseCache = null, franchiseAt = 0;
 async function getFranchiseCsv() {
@@ -64,6 +66,7 @@ async function sendDocument(chatId, filename, buffer, caption) {
   return r.json();
 }
 function dot(p){ return p>=0.8?"🟢":p>=0.5?"🟡":"🔴"; }
+function safeName(s){ return String(s||"Клиент").replace(/[\\/:*?"<>|\n\r]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80) || "Клиент"; }
 
 const WELCOME =
   "<b>Finpark · Бот оценки диагностик</b>\n\n" +
@@ -72,7 +75,7 @@ const WELCOME =
   "• <b>ссылкой</b> (в т.ч. Google Docs — открытый «по ссылке»);\n" +
   "• <b>файлом</b> .docx (Word) или .txt.\n\n" +
   "Я оценю её по 8 этапам продаж (светофор + балл), а затем предложу подготовить " +
-  "<b>КП-презентацию</b> и <b>договор</b>.\n\nКоманда: /start — это сообщение.";
+  "<b>Результаты диагностики (PDF)</b> и <b>договор</b>.\n\nКоманда: /start — это сообщение.";
 
 // ---------- источники ----------
 async function readDocumentText(doc) {
@@ -139,10 +142,10 @@ function buildReport(p) {
   return t;
 }
 
-// ---------- КП: извлечение данных ----------
+// ---------- извлечение данных для документа ----------
 async function extractKp(transcript) {
   const prompt =
-    "Из ТЕКСТА ДИАГНОСТИКИ извлеки данные для коммерческого предложения Finpark. " +
+    "Из ТЕКСТА ДИАГНОСТИКИ извлеки данные для документа «Результаты диагностики» Finpark. " +
     "Боли (pains) и решения (solution) формулируй индивидуально и конкретно под этого клиента (5-6 пунктов, по фактам из текста). " +
     "Цену бери ту, что партнёр озвучил клиенту в тексте (ежемесячный платёж в тенге, только цифры, например 970000); если цена не названа — null.\n\n" +
     "ТЕКСТ:\n" + transcript.slice(0, 60000) +
@@ -152,193 +155,183 @@ async function extractKp(transcript) {
 
 function fmtPrice(p) { const n = String(p).replace(/\D/g, ""); return n ? n.replace(/\B(?=(\d{3})+(?!\d))/g, " ") + " ₸" : ""; }
 
-// ---------- КП: сборка презентации (полный набор разделов) ----------
-async function buildKpPptx(kp, chatId) {
-  const p = new PptxGenJS();
-  p.defineLayout({ name: "FP", width: 13.33, height: 7.5 });
-  p.layout = "FP";
-  const W = 13.33, H = 7.5;
-  const company = kp.company && kp.company !== "Клиент" ? kp.company : "вашей компании";
+// ---------- «Результаты диагностики» (PDF) ----------
+function buildKpPdf(kp) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margins: { top: 55, bottom: 60, left: 55, right: 55 }, bufferPages: true });
+    doc.registerFont("R", FONT_R); doc.registerFont("B", FONT_B);
+    const chunks = []; doc.on("data", c => chunks.push(c)); doc.on("end", () => resolve(Buffer.concat(chunks))); doc.on("error", reject);
+    const M = 55, PW = doc.page.width, CW = PW - 2 * M, BOT = () => doc.page.height - 60;
+    const company = kp.company && kp.company !== "Клиент" ? kp.company : "вашей компании";
+    const ensure = h => { if (doc.y + h > BOT()) doc.addPage(); };
+    const H = t => { ensure(50); const y = doc.y; doc.roundedRect(M, y, CW, 28, 4).fill(NAVY); doc.fillColor("#FFFFFF").font("B").fontSize(13).text(t, M + 12, y + 7, { width: CW - 24 }); doc.y = y + 28; doc.moveDown(0.5); doc.fillColor("#000000"); };
+    const P = (t, o = {}) => { doc.font(o.b ? "B" : "R").fontSize(o.fs || 11).fillColor(o.color || "#222222"); ensure(doc.heightOfString(t, { width: CW }) + 4); doc.text(t, M, doc.y, { width: CW, align: o.align || "left", paragraphGap: o.gap == null ? 4 : o.gap }); };
+    const BL = (arr, check) => { (arr || []).forEach(t => { doc.font("R").fontSize(11); const hh = doc.heightOfString(t, { width: CW - 18 }); ensure(hh + 4); const y = doc.y; doc.font("B").fillColor(check ? GREEN : BLUE).fontSize(11).text(check ? "✓" : "•", M, y, { width: 14 }); doc.font("R").fillColor("#222222").text(t, M + 16, y, { width: CW - 16, paragraphGap: 5 }); }); };
+    const statGrid = items => {
+      const cols = 3, gap = 10, cardW = (CW - gap * (cols - 1)) / cols, cardH = 58;
+      let i = 0;
+      while (i < items.length) {
+        ensure(cardH + gap);
+        const rowY = doc.y;
+        for (let col = 0; col < cols && i < items.length; col++, i++) {
+          const x = M + col * (cardW + gap);
+          doc.roundedRect(x, rowY, cardW, cardH, 4).fillAndStroke(LIGHT, "#D5E0F0");
+          doc.fillColor(BLUE).font("B").fontSize(15).text(items[i][0], x + 4, rowY + 9, { width: cardW - 8, align: "center" });
+          doc.fillColor(GREYT).font("R").fontSize(8.5).text(items[i][1], x + 6, rowY + 33, { width: cardW - 12, align: "center" });
+        }
+        doc.y = rowY + cardH + gap;
+      }
+      doc.x = M; doc.fillColor("#000000");
+    };
+    const table = (rows, widths, headFill) => {
+      const pad = 5;
+      rows.forEach((row, ri) => {
+        doc.font(ri === 0 ? "B" : "R").fontSize(ri === 0 ? 10 : 9.5);
+        let rowH = 0;
+        row.forEach((c, ci) => { const h = doc.heightOfString(String(c), { width: widths[ci] - 2 * pad }); if (h > rowH) rowH = h; });
+        rowH += 2 * pad;
+        ensure(rowH);
+        let x = M; const y = doc.y;
+        row.forEach((c, ci) => {
+          if (ri === 0) doc.rect(x, y, widths[ci], rowH).fill(headFill || NAVY);
+          else doc.rect(x, y, widths[ci], rowH).stroke("#DDDDDD");
+          doc.fillColor(ri === 0 ? "#FFFFFF" : "#222222").font(ri === 0 ? "B" : "R").fontSize(ri === 0 ? 10 : 9.5)
+            .text(String(c), x + pad, y + pad, { width: widths[ci] - 2 * pad });
+          x += widths[ci];
+        });
+        doc.y = y + rowH;
+      });
+      doc.moveDown(0.5); doc.fillColor("#000000");
+    };
 
-  const header = (s, txt) => {
-    s.addShape(p.ShapeType.rect, { x: 0, y: 0, w: W, h: 1.15, fill: { color: NAVY } });
-    s.addText(txt, { x: 0.6, y: 0.18, w: W - 1.2, h: 0.8, fontSize: 24, bold: true, color: "FFFFFF", valign: "middle" });
-  };
-  const bullets = (s, arr, opt = {}) => s.addText((arr || []).map(t => ({ text: t, options: { bullet: { code: opt.check ? "2713" : "2022" }, color: opt.color || "333333", fontSize: opt.fs || 17, paraSpaceAfter: 9 } })), { x: 0.7, y: 1.5, w: W - 1.4, h: H - 2, valign: "top" });
-  const note = (s, txt, y) => s.addText(txt, { x: 0.7, y: y || (H - 1), w: W - 1.4, h: 0.7, fontSize: 14, italic: true, color: GREYT });
+    // Обложка
+    doc.rect(0, 0, PW, doc.page.height).fill(NAVY);
+    doc.fillColor("#FFFFFF").font("B").fontSize(20).text("FINPARK", M, 90, { characterSpacing: 3 });
+    doc.font("B").fontSize(34).text("Результаты диагностики", M, 250, { width: CW });
+    doc.font("R").fontSize(16).fillColor("#BCD3EE").text("Финансовая система для бизнеса под ключ", M, 320, { width: CW });
+    doc.font("R").fontSize(16).fillColor("#FFFFFF").text("для " + company, M, 360, { width: CW });
+    doc.font("R").fontSize(11).fillColor("#9FB6D6").text("Онлайн-сопровождение для предпринимателей · " + new Date().toLocaleDateString("ru-RU"), M, doc.page.height - 90, { width: CW });
 
-  // 1. Титул
-  let s = p.addSlide(); s.background = { color: NAVY };
-  s.addText("FINPARK", { x: 0.7, y: 0.7, w: 6, h: 0.6, fontSize: 22, bold: true, color: "FFFFFF", charSpacing: 4 });
-  s.addText("Коммерческое предложение", { x: 0.7, y: 2.4, w: W - 1.4, h: 1, fontSize: 40, bold: true, color: "FFFFFF" });
-  s.addText("Финансовая система для бизнеса под ключ", { x: 0.7, y: 3.5, w: W - 1.4, h: 0.7, fontSize: 22, color: "BCD3EE" });
-  s.addText("для " + company, { x: 0.7, y: 4.5, w: W - 1.4, h: 0.7, fontSize: 22, italic: true, color: "FFFFFF" });
-  s.addText("Онлайн-сопровождение для предпринимателей", { x: 0.7, y: H - 0.9, w: W - 1.4, h: 0.5, fontSize: 14, color: "9FB6D6" });
+    doc.addPage(); doc.fillColor("#000000");
 
-  // 2. По итогам встречи
-  s = p.addSlide(); header(s, "По итогам встречи вы узнаете");
-  bullets(s, ["Для чего в компаниях нужен управленческий учёт", "Какие проблемы решает финансовый директор на аутсорсе от Finpark", "В чём преимущества финдиректора на аутсорсе", "Какие у финдиректора обязанности и обязательства перед компанией", "Как изменятся финансовое и стратегическое планирование после внедрения управленческого учёта"]);
+    H("О Finpark");
+    statGrid([["7+ лет", "на рынке консалтинга"], ["300+", "клиентов по миру"], ["93%", "второй договор"], ["1+ млрд ₸", "прибыли клиентам"], ["923+ млн ₸", "сберегли клиентам"], ["215+ млн ₸", "высвободили в бизнесе"]]);
+    P("Работаем с клиентами из 8+ стран: Казахстан, Россия, СНГ, США, ОАЭ, Германия.", { color: GREYT, fs: 10 });
+    doc.moveDown(0.4);
 
-  // 3. О Finpark — цифры
-  s = p.addSlide(); header(s, "О Finpark");
-  const stats = [["7+ лет", "на рынке финансового консалтинга"], ["300+", "клиентов по всему миру"], ["93%", "подписывают второй договор"], ["1+ млрд ₸", "увеличили прибыль клиентов"], ["923+ млн ₸", "сберегли клиентам"], ["215+ млн ₸", "высвободили внутри бизнеса"]];
-  stats.forEach((st, i) => {
-    const x = 0.7 + (i % 3) * 4.1, y = 1.6 + Math.floor(i / 3) * 2.5;
-    s.addShape(p.ShapeType.roundRect, { x, y, w: 3.8, h: 2.2, fill: { color: LIGHT }, line: { color: "D5E0F0" }, rectRadius: 0.08 });
-    s.addText(st[0], { x: x + 0.1, y: y + 0.25, w: 3.6, h: 0.9, fontSize: 28, bold: true, color: BLUE, align: "center" });
-    s.addText(st[1], { x: x + 0.15, y: y + 1.15, w: 3.5, h: 0.9, fontSize: 14, color: GREYT, align: "center" });
+    H("Об основательнице компании");
+    P("Шанайбаева Жулдыз Абзаловна", { b: true, fs: 12, color: NAVY });
+    BL(["Предприниматель и эксперт с опытом в финансах 10+ лет", "4 года в Big4 — руководство аудитом национальных и иностранных компаний", "2+ млрд тенге привлечённых инвестиций", "Спикер международных площадок (BigMoney и др.)", "Квалификация ACCA: 24 место в мире и 1 в Казахстане по экзамену ACCA AAA"]);
+    doc.moveDown(0.4);
+
+    H("Проблема: бизнес без управленческого учёта теряет деньги");
+    BL(["Открывают новые направления, думая, что увеличат доход", "Сталкиваются с воровством денег и продукции", "Кассовые разрывы — не хватает на зарплаты, дивиденды, поставщиков", "Управляют вслепую, опираясь на ощущения, а не на данные", "Не понимают, почему нет прибыли и как расти дальше"]);
+    doc.moveDown(0.4);
+
+    H("Ваша ситуация сейчас");
+    BL(kp.pains || []);
+    doc.moveDown(0.4);
+
+    H("Решение: финансовый директор на аутсорсе Finpark");
+    BL((kp.solution && kp.solution.length ? kp.solution : ["Строит управленческую отчётность и контролирует показатели", "Управляет денежными потоками и финансовой безопасностью", "Выявляет причины потерь и точки роста", "Приводит компанию к конкретным финансовым результатам"]), true);
+    P("Мы не просто считаем цифры — мы делаем собственника сильнее.", { color: GREYT, fs: 10 });
+    doc.moveDown(0.4);
+
+    H("Чем Finpark отличается от других");
+    table([["Другие", "Finpark"], ["Показывают прошлое, считают постфактум", "Показывает точки роста: где теряется прибыль и как исправить"], ["Холодные таблицы и термины, тревога", "Язык собственника, даёт контроль и спокойствие"], ["Дают таблицы, непонятно что делать", "Находит потерянные деньги и превращает в план действий"], ["Не отвечают за результат", "Отвечает за внедрение и результат — ваши дивиденды"]], [CW / 2, CW / 2]);
+
+    H("Наши обязательства перед компанией");
+    BL(["Рассчитываем прибыльность: прибыль в ОПиУ без НДС, маржинальность по направлениям, прибыль 3 месяца подряд", "Способствуем росту капитала: управленческий баланс без дыр, ежемесячный рост собственного капитала", "Обеспечиваем финансовую безопасность: баланс капитала 50/50–70/30, контроль дебиторки и кредиторки", "Планируем чистую прибыль с точностью до 80%: отклонение факта от плана не более 20%"], true);
+    doc.moveDown(0.4);
+
+    H("Наши специалисты");
+    BL(["Финдиректора с опытом в международных компаниях «Большой четвёрки» (Big-4)", "Высшее образование в финансах и бухучёте + повышение квалификации", "Регулярный ассесмент компетенций и подбор сильного состава", "Контроль со стороны руководителей отделов консалтинга и контроля качества", "Аудит каждого звонка финдиректора с клиентом; командное сопровождение"]);
+    doc.moveDown(0.4);
+
+    H("Работаем с разными нишами");
+    BL(["Общепит: оборачиваемость столов, food/labor cost, калькуляция и анализ меню", "Онлайн-бизнес: CAC, LTV, ROMI, конверсия в оплату, маржинальность продукта", "Производство: себестоимость, эффективность, складские остатки", "Товарный бизнес: оборачиваемость, ABC/XYZ анализ, закуп vs цена, товарные потери"]);
+    doc.moveDown(0.4);
+
+    H("Финдиректор Finpark vs штатный");
+    table([["Критерий", "Finpark", "Штатный"], ["Оплата", "За фактически оказанные услуги", "Оклад + налоги + льготы"], ["Квалификация", "Команда экспертов из отраслей", "Один специалист"], ["Гибкость", "По мере необходимости", "Постоянная занятость"], ["Ответственность", "За результат", "На собственнике"]], [CW * 0.22, CW * 0.42, CW * 0.36]);
+
+    H("Реальная экономика выбора");
+    table([["", "Штатный финдиректор", "Финдиректор Finpark"], ["Затраты в месяц", "1 705 074 ₸ (оклад + налоги)", "от 400 000 – 600 000 ₸"], ["Подтверждение расходов", "Сложно / не всегда", "Прозрачный учёт"], ["Экономия", "—", "до 735 074 ₸/мес · 13,2 млн ₸/год"]], [CW * 0.24, CW * 0.4, CW * 0.36], GREYT);
+
+    H("Что делает финдиректор Finpark");
+    P("1. Создаёт архитектуру управленческой отчётности", { b: true, fs: 11, color: NAVY });
+    P("Аудит финансовой части → интервью с собственником → финансовая модель и формы отчётов. Итог: ОПиУ, ДДС, баланс и дашборды.");
+    P("2. Внедряет финансовый менеджмент", { b: true, fs: 11, color: NAVY });
+    P("Стратегическое планирование → тест гипотез → поручения сотрудникам → контроль исполнения. Итог: аналитика под нишу и бюджетирование.");
+    doc.moveDown(0.4);
+
+    H("Наше предложение: 6 месяцев сопровождения");
+    BL(["Управленческая отчётность: ОПиУ, ДДС, Балансовый отчёт + дашборды", "Финансовая модель на 12 месяцев", "6 стратегических сессий с менеджментом", "До 2 онлайн-встреч с финдиректором в неделю", "24 планёрки по контролю расходов", "Защита цифр перед инвесторами, дорожная карта проекта", "Чат с финдиректором в рабочее время (пн–пт 09:00–18:00)"]);
+    doc.moveDown(0.4);
+
+    H("Результат работы с Finpark");
+    BL(["Порядок в финансах: внедрены финмодель и отчёты, положительный остаток по операционке", "Контроль расходов: устранены кассовые разрывы, календарь платежей, неликвид обращён в деньги", "Устойчивая прибыль 3 месяца подряд", "Регулярные дивиденды без ущерба для компании", "Данные для управленческих решений на основе твёрдых цифр"], true);
+    doc.moveDown(0.4);
+
+    H("Почему нас выбирают — 93% продолжают сотрудничество");
+    BL(["Выводим компанию на окупаемость и отвечаем за финансовый результат (методология Finpark, 5+ лет)", "Приучаем мыслить категориями чистой прибыли, а не оборота", "Расходы на финдиректора окупаются: собственник начинает контролировать финансы"]);
+    doc.moveDown(0.4);
+
+    H("Кейсы");
+    P("Кейс №1 · Услуги — сэкономили 5,2 млн ₸ в год", { b: true, color: NAVY });
+    P("Построили ОПиУ по филиалам, выявили убыточный филиал, оптимизировали и закрыли его, перераспределив сотрудников. Снизили убытки на 440 тыс ₸/мес.");
+    P("Кейс №2 · Услуги — чистая прибыль выросла на 17 млн ₸", { b: true, color: NAVY });
+    P("Построили финмодель, внедрили CRM и пересмотрели KPI менеджеров. Бизнес вышел из убытков, продажи выросли в 2 раза.");
+    doc.moveDown(0.4);
+
+    H("Стоимость");
+    const m = Number(String(kp.price || "").replace(/\D/g, "")) || 0;
+    if (m) {
+      const o3 = Math.round(m * 0.959 / 1000) * 1000, o6 = Math.round(m * 0.927 / 1000) * 1000;
+      P(fmtPrice(m) + " / месяц", { b: true, fs: 20, color: NAVY });
+      doc.moveDown(0.3);
+      table([["Вариант оплаты", "Платёж в месяц", "За 6 месяцев"], ["Ежемесячно", fmtPrice(m), fmtPrice(m * 6)], ["При оплате за 3 месяца", fmtPrice(o3), fmtPrice(o3 * 6)], ["При оплате за 6 месяцев", fmtPrice(o6), fmtPrice(o6 * 6)]], [CW * 0.4, CW * 0.3, CW * 0.3]);
+      P("Минимальный срок работы по договору — 6 месяцев.", { color: GREYT, fs: 10 });
+    } else {
+      P("Индивидуальные условия обсуждаются с вашим финансовым директором.", { fs: 13, color: NAVY });
+    }
+    doc.moveDown(0.6);
+
+    H("Контакты");
+    P("Свяжитесь с вашим финансовым директором Finpark, чтобы начать. Не откладывайте внедрение управленческого учёта.", { fs: 12 });
+
+    doc.end();
   });
-  note(s, "Работаем с клиентами из 8+ стран: Казахстан, Россия, СНГ, США, ОАЭ, Германия.");
-
-  // 4. Об основательнице
-  s = p.addSlide(); header(s, "Об основательнице компании");
-  s.addText("Шанайбаева Жулдыз Абзаловна", { x: 0.7, y: 1.4, w: W - 1.4, h: 0.6, fontSize: 22, bold: true, color: NAVY });
-  bullets(s, ["Предприниматель и эксперт с опытом в финансах 10+ лет", "4 года в Big4 — руководство аудитом национальных и иностранных компаний", "2+ млрд тенге привлечённых инвестиций", "Спикер международных площадок (BigMoney и др.)", "Квалификация ACCA: 24 место в мире и 1 место в Казахстане по экзамену ACCA AAA"], { fs: 16 });
-  s.getSlide && 0;
-  s.addText("В основе методологии Finpark — международный опыт, адаптированный под местный менталитет.", { x: 0.7, y: H - 1, w: W - 1.4, h: 0.6, fontSize: 14, italic: true, color: GREYT });
-
-  // 5. Проблема (общая)
-  s = p.addSlide(); header(s, "Проблема: бизнес без управленческого учёта теряет деньги");
-  bullets(s, ["Открывают новые направления, думая, что увеличат доход", "Сталкиваются с воровством денег и продукции", "Имеют кассовые разрывы — не хватает на зарплаты, дивиденды, поставщиков", "Управляют вслепую, опираясь на ощущения, а не на данные", "Не понимают, почему нет прибыли и как расти дальше", "Не зарабатывают, потому что не видят свои дивиденды"], { fs: 16 });
-
-  // 6. Ваша ситуация (ПЕРСОНАЛЬНО)
-  s = p.addSlide(); header(s, "Ваша ситуация сейчас");
-  bullets(s, kp.pains || [], { fs: 18 });
-
-  // 7. Решение
-  s = p.addSlide(); header(s, "Решение: финансовый директор на аутсорсе Finpark");
-  bullets(s, (kp.solution && kp.solution.length ? kp.solution : ["Погружается в процессы и строит управленческую отчётность", "Контролирует выполнение финансовых показателей", "Управляет денежными потоками и финансовой безопасностью", "Выявляет причины потерь и точки роста", "Приводит компанию к конкретным финансовым результатам"]), { check: true, fs: 17 });
-  note(s, "Мы не просто считаем цифры — мы делаем собственника сильнее.");
-
-  // 8. Чем отличаемся
-  s = p.addSlide(); header(s, "Чем Finpark отличается от других");
-  s.addTable([
-    [{ text: "Другие", options: { bold: true, color: "FFFFFF", fill: GREYT } }, { text: "Finpark", options: { bold: true, color: "FFFFFF", fill: NAVY } }],
-    ["Показывают прошлое, считают постфактум", "Показывает точки роста: где теряется прибыль и как это исправить"],
-    ["Холодные таблицы и термины, создают тревогу", "Язык собственника, убирает тревогу, даёт контроль"],
-    ["Дают таблицы, но непонятно, что делать", "Находит потерянные деньги и превращает в план действий"],
-    ["Не отвечают, сработают ли рекомендации", "Отвечает за внедрение системы и результат — ваши дивиденды"]
-  ], { x: 0.6, y: 1.5, w: W - 1.2, colW: [6.05, 6.08], fontSize: 14, border: { type: "solid", color: "DDDDDD" }, valign: "middle", rowH: 0.9 });
-
-  // 9. Обязательства
-  s = p.addSlide(); header(s, "Наши обязательства перед компанией");
-  bullets(s, ["Рассчитываем прибыльность: прибыль в ОПиУ без НДС, маржинальность по направлениям, прибыль 3 месяца подряд", "Способствуем росту капитала: управленческий баланс без дыр, ежемесячный рост собственного капитала", "Обеспечиваем финансовую безопасность: баланс капитала 50/50–70/30, контроль дебиторки и кредиторки", "Планируем чистую прибыль с точностью до 80%: отклонение факта от плана не более 20%"], { check: true, fs: 16 });
-  note(s, "«Где больше правды в цифрах, там больше денег» — философия Finpark.");
-
-  // 10. Специалисты
-  s = p.addSlide(); header(s, "Наши специалисты");
-  bullets(s, ["Финдиректора с опытом в международных компаниях «Большой четвёрки» (Big-4)", "Высшее образование в сфере финансов и бухучёта + системное повышение квалификации", "Регулярный ассесмент компетенций и подбор сильного состава", "Контроль со стороны руководителей отделов консалтинга и контроля качества", "Аудит каждого звонка финдиректора с клиентом", "Командное сопровождение: финдиректор + РОК + менеджер"], { fs: 16 });
-
-  // 11. Ниши
-  s = p.addSlide(); header(s, "Работаем с разными бизнес-моделями");
-  const niches = [["Общепит", "оборачиваемость столов, food cost / labor cost, калькуляция и анализ меню, загрузка по времени"], ["Онлайн-бизнес", "CAC, LTV, ROMI, конверсия в оплату, маржинальность продукта"], ["Производство", "себестоимость, эффективность производства, складские остатки"], ["Товарный бизнес", "оборачиваемость остатков, ABC/XYZ анализ, закуп vs цена, товарные потери"]];
-  niches.forEach((n, i) => {
-    const x = 0.7 + (i % 2) * 6.1, y = 1.5 + Math.floor(i / 2) * 2.6;
-    s.addShape(p.ShapeType.roundRect, { x, y, w: 5.8, h: 2.3, fill: { color: LIGHT }, line: { color: "D5E0F0" }, rectRadius: 0.06 });
-    s.addText(n[0], { x: x + 0.25, y: y + 0.2, w: 5.3, h: 0.5, fontSize: 18, bold: true, color: NAVY });
-    s.addText(n[1], { x: x + 0.25, y: y + 0.8, w: 5.3, h: 1.4, fontSize: 13, color: "333333" });
-  });
-
-  // 12. Finpark vs штатный
-  s = p.addSlide(); header(s, "Финдиректор Finpark vs штатный");
-  s.addTable([
-    [{ text: "Критерий", options: { bold: true, color: "FFFFFF", fill: NAVY } }, { text: "Finpark", options: { bold: true, color: "FFFFFF", fill: NAVY } }, { text: "Штатный", options: { bold: true, color: "FFFFFF", fill: NAVY } }],
-    ["Оплата", "За фактически оказанные услуги", "Полный оклад + налоги + льготы"],
-    ["Квалификация", "Команда экспертов из разных отраслей", "Один специалист, ограниченный опыт"],
-    ["Гибкость", "Привлечение по мере необходимости", "Постоянное рабочее место и занятость"],
-    ["Ответственность", "Берёт ответственность за результат", "Остаётся на собственнике"]
-  ], { x: 0.6, y: 1.5, w: W - 1.2, colW: [3, 4.55, 4.58], fontSize: 14, border: { type: "solid", color: "DDDDDD" }, valign: "middle", rowH: 0.85 });
-
-  // 13. Реальная экономика
-  s = p.addSlide(); header(s, "Реальная экономика выбора");
-  s.addTable([
-    [{ text: "", options: { fill: "FFFFFF" } }, { text: "Штатный финдиректор", options: { bold: true, color: "FFFFFF", fill: GREYT } }, { text: "Финдиректор Finpark", options: { bold: true, color: "FFFFFF", fill: NAVY } }],
-    ["Затраты в месяц", "1 705 074 ₸ (оклад + налоги + рабочее место)", "от 400 000 – 600 000 ₸"],
-    ["Подтверждение расходов", "Сложно / не всегда", "Прозрачный затратный учёт"],
-    ["Экономия", "—", "до 735 074 ₸ в месяц · 13,2 млн ₸ в год"]
-  ], { x: 0.6, y: 1.5, w: W - 1.2, colW: [3, 4.55, 4.58], fontSize: 14, border: { type: "solid", color: "DDDDDD" }, valign: "middle", rowH: 0.95 });
-
-  // 14. Виды работ
-  s = p.addSlide(); header(s, "Что делает финдиректор Finpark");
-  s.addText("1. Создаёт архитектуру управленческой отчётности", { x: 0.7, y: 1.5, w: W - 1.4, h: 0.5, fontSize: 17, bold: true, color: NAVY });
-  s.addText("Аудит финансовой части → интервью с собственником → финансовая модель и формы отчётов. Итог: ОПиУ, ДДС, баланс и дашборды.", { x: 0.9, y: 2.0, w: W - 1.8, h: 1.1, fontSize: 14, color: "333333" });
-  s.addText("2. Внедряет финансовый менеджмент", { x: 0.7, y: 3.4, w: W - 1.4, h: 0.5, fontSize: 17, bold: true, color: NAVY });
-  s.addText("Стратегическое планирование → тест гипотез → поручения сотрудникам → контроль исполнения в рамках долгосрочных целей. Итог: аналитика под нишу и бюджетирование.", { x: 0.9, y: 3.9, w: W - 1.8, h: 1.2, fontSize: 14, color: "333333" });
-
-  // 15. Наше предложение
-  s = p.addSlide(); header(s, "Наше предложение: 6 месяцев сопровождения");
-  bullets(s, ["Управленческая отчётность: ОПиУ, ДДС, Балансовый отчёт + дашборды", "Финансовая модель на 12 месяцев", "6 стратегических сессий с менеджментом", "До 2 онлайн-встреч с финдиректором в неделю", "24 планёрки по контролю расходов", "Защита цифр перед инвесторами, дорожная карта проекта", "Чат с финдиректором в рабочее время (пн–пт 09:00–18:00)"], { fs: 15 });
-
-  // 16. Обучение
-  s = p.addSlide(); header(s, "Обучение и развитие");
-  s.addText("Для собственника:", { x: 0.7, y: 1.5, w: 5.8, h: 0.5, fontSize: 16, bold: true, color: NAVY });
-  s.addText([{ text: "Развитие финансового мышления", options: { bullet: { code: "2022" }, fontSize: 14, paraSpaceAfter: 6 } }, { text: "Принятие решений через цифры", options: { bullet: { code: "2022" }, fontSize: 14, paraSpaceAfter: 6 } }, { text: "Материалы по финансовой грамотности", options: { bullet: { code: "2022" }, fontSize: 14 } }], { x: 0.9, y: 2.0, w: 5.5, h: 2.5, valign: "top", color: "333333" });
-  s.addText("Для команды:", { x: 6.9, y: 1.5, w: 5.8, h: 0.5, fontSize: 16, bold: true, color: NAVY });
-  s.addText([{ text: "Программа «Сам себе финдир»", options: { bullet: { code: "2022" }, fontSize: 14, paraSpaceAfter: 6 } }, { text: "Базовая финансовая грамотность", options: { bullet: { code: "2022" }, fontSize: 14, paraSpaceAfter: 6 } }, { text: "Работа с управленческой отчётностью", options: { bullet: { code: "2022" }, fontSize: 14 } }], { x: 7.1, y: 2.0, w: 5.5, h: 2.5, valign: "top", color: "333333" });
-
-  // 17. Результат
-  s = p.addSlide(); header(s, "Результат работы с Finpark");
-  bullets(s, ["Порядок в финансах: внедрены финмодель и управленческие отчёты, положительный остаток по операционке", "Контроль расходов: устранены кассовые разрывы, календарь платежей, неликвид обращён в деньги", "Стратегия развития: устойчивая прибыль 3 месяца подряд", "Регулярные дивиденды в любых обстоятельствах без ущерба для компании", "Данные для управленческих решений на основе твёрдых цифр"], { check: true, fs: 16 });
-
-  // 18. Почему выбирают
-  s = p.addSlide(); header(s, "Почему нас выбирают — 93% продолжают сотрудничество");
-  bullets(s, ["Выводим компанию на окупаемость и отвечаем за финансовый результат (авторская методология Finpark, 5+ лет)", "Приучаем мыслить категориями чистой прибыли, а не оборота — показываем на цифрах", "Расходы на финдиректора Finpark окупаются: собственник начинает понимать процессы и контролировать финансы"], { fs: 16 });
-
-  // 19. Кейсы
-  s = p.addSlide(); header(s, "Кейсы");
-  s.addText("Кейс №1 · Услуги — сэкономили 5,2 млн ₸ в год", { x: 0.7, y: 1.45, w: W - 1.4, h: 0.5, fontSize: 16, bold: true, color: NAVY });
-  s.addText("Построили ОПиУ с разделением по филиалам, выявили убыточный филиал, оптимизировали и закрыли его, перераспределив сотрудников. Снизили убытки на 440 тыс ₸/мес.", { x: 0.9, y: 1.95, w: W - 1.8, h: 1.2, fontSize: 14, color: "333333" });
-  s.addText("Кейс №2 · Услуги — чистая прибыль выросла на 17 млн ₸", { x: 0.7, y: 3.5, w: W - 1.4, h: 0.5, fontSize: 16, bold: true, color: NAVY });
-  s.addText("Построили финмодель, внедрили CRM и пересмотрели KPI менеджеров (план продаж, конверсия, средний чек). Бизнес вышел из убытков, продажи выросли в 2 раза.", { x: 0.9, y: 4.0, w: W - 1.8, h: 1.2, fontSize: 14, color: "333333" });
-
-  // 20. Примеры оформления
-  s = p.addSlide(); header(s, "Примеры оформления");
-  bullets(s, ["Дорожная карта проекта — этапы работы с конкретными сроками", "Финансовая модель — проверка бизнес-идей в цифрах", "Отчёт о движении денежных средств (ДДС)", "Отчёт о прибылях и убытках (ОПиУ)", "Балансовый отчёт — активы и обязательства", "Дашборды и аналитика под вашу нишу"], { fs: 16 });
-
-  // 21. Стоимость (ПЕРСОНАЛЬНО)
-  s = p.addSlide(); s.background = { color: LIGHT }; header(s, "Стоимость");
-  const m = Number(String(kp.price || "").replace(/\D/g, "")) || 0;
-  if (m) {
-    const opt3 = Math.round(m * 0.959 / 1000) * 1000, opt6 = Math.round(m * 0.927 / 1000) * 1000;
-    s.addText(fmtPrice(m) + " / месяц", { x: 0.7, y: 1.5, w: W - 1.4, h: 1, fontSize: 40, bold: true, color: NAVY });
-    s.addTable([
-      [{ text: "Вариант оплаты", options: { bold: true, color: "FFFFFF", fill: NAVY } }, { text: "Платёж в месяц", options: { bold: true, color: "FFFFFF", fill: NAVY } }, { text: "За 6 месяцев", options: { bold: true, color: "FFFFFF", fill: NAVY } }],
-      ["Ежемесячно", fmtPrice(m), fmtPrice(m * 6)],
-      ["При оплате за 3 месяца", fmtPrice(opt3), fmtPrice(opt6 ? opt3 * 6 : m * 6)],
-      ["При оплате за 6 месяцев", fmtPrice(opt6), fmtPrice(opt6 * 6)]
-    ], { x: 0.7, y: 2.7, w: W - 1.4, colW: [4.6, 3.6, 3.93], fontSize: 15, border: { type: "solid", color: "C9D6EA" }, valign: "middle", rowH: 0.7, fill: { color: "FFFFFF" } });
-    s.addText("Минимальный срок работы по договору — 6 месяцев.", { x: 0.7, y: H - 1.1, w: W - 1.4, h: 0.5, fontSize: 14, italic: true, color: GREYT });
-  } else {
-    s.addText("Индивидуальные условия обсуждаются с вашим финансовым директором.", { x: 0.7, y: 2.5, w: W - 1.4, h: 1, fontSize: 24, color: NAVY });
-  }
-
-  // 22. Контакты
-  s = p.addSlide(); s.background = { color: NAVY };
-  s.addText("Увеличьте финансовые показатели уже сейчас", { x: 0.7, y: 2.4, w: W - 1.4, h: 1.2, fontSize: 30, bold: true, color: "FFFFFF" });
-  s.addText("Не откладывайте внедрение управленческого учёта.", { x: 0.7, y: 3.6, w: W - 1.4, h: 0.7, fontSize: 18, color: "BCD3EE" });
-  s.addText("Свяжитесь с вашим финансовым директором Finpark для старта.", { x: 0.7, y: 4.3, w: W - 1.4, h: 0.7, fontSize: 16, color: "9FB6D6" });
-
-  const file = path.join("/tmp", "kp_" + chatId + "_" + Date.now() + ".pptx");
-  await p.writeFile({ fileName: file });
-  const buf = fs.readFileSync(file); fs.unlink(file, () => {});
-  return buf;
 }
 
 // ---------- Договор ----------
+async function contractMissing(requisites, price) {
+  const franchise = await getFranchiseCsv();
+  const prompt =
+    "Проверь, достаточно ли данных, чтобы заполнить договор оказания услуг БЕЗ ПРОЧЕРКОВ. " +
+    "Обязательные поля: номер договора; по ЗАКАЗЧИКУ и по ИСПОЛНИТЕЛЮ — наименование/ИП, БИН/ИИН, юр.адрес, в лице (ФИО+должность), основание (устав/свидетельство/доверенность), банковские реквизиты; ежемесячная цена; номер и дата договора франшизы исполнителя (его нужно взять из таблицы франшиз по наименованию/БИН/ФИО исполнителя). " +
+    "Цена сейчас: " + (price || "не указана") + ". " +
+    "Сопоставь РЕКВИЗИТЫ с обязательными полями и верни список того, чего НЕ ХВАТАЕТ, короткими вопросами на русском. Если франшиза исполнителя не найдена в таблице — добавь вопрос про номер и дату договора франшизы.\n\n" +
+    "ТАБЛИЦА ФРАНШИЗ (CSV):\n" + (franchise ? franchise.slice(0, 12000) : "(недоступна)") +
+    "\n\nРЕКВИЗИТЫ:\n" + requisites +
+    '\n\nВерни СТРОГО JSON без markdown: {"questions":["вопрос1","вопрос2", ...]} (пустой массив, если всё есть).';
+  try { const j = parseJson(await callClaude(prompt, 1200)); return Array.isArray(j.questions) ? j.questions : []; }
+  catch { return []; }
+}
+
 async function buildContractDocx(requisites, price) {
   const franchise = await getFranchiseCsv();
   const prompt =
     "Заполни ПРОПУСКИ в договоре (отмечены подчёркиваниями) данными из РЕКВИЗИТОВ. " +
     "Стоимость услуг за 6 месяцев и ежемесячный платёж рассчитай из ежемесячной цены: ежемесячно = " + (price || "указанной в реквизитах") + " тенге, за 6 месяцев = ежемесячно × 6. " +
-    "Везде, где требуется «(сумма прописью)», впиши сумму словами на русском. Дату договора поставь сегодняшней. " +
-    "В пункте про «Договор Комплексной Предпринимательской Лицензии (Франчайзинг) №__ от __» подставь НОМЕР И ДАТУ договора франшизы ИСПОЛНИТЕЛЯ из ТАБЛИЦЫ ФРАНШИЗ ниже — найди строку по наименованию/БИН/ФИО исполнителя и возьми значение из колонки «Договор франшизы Номер и Дата» (например «№13 от 02.05.2024»). Если исполнитель в таблице не найден — оставь пропуск. " +
-    "Сохрани ВЕСЬ текст и структуру договора без изменений, только заполни пропуски. Если каких-то данных нет — оставь короткий пропуск «____».\n\n" +
+    "Везде, где требуется «(сумма прописью)», впиши сумму словами на русском. Дату договора поставь сегодняшней, если номер договора не задан — оставь «№ ___». " +
+    "В пункте про «Договор Комплексной Предпринимательской Лицензии (Франчайзинг) №__ от __» подставь НОМЕР И ДАТУ договора франшизы ИСПОЛНИТЕЛЯ из ТАБЛИЦЫ ФРАНШИЗ ниже — найди строку по наименованию/БИН/ФИО исполнителя и возьми значение из колонки «Договор франшизы Номер и Дата». " +
+    "Сохрани ВЕСЬ текст и структуру договора без изменений, только заполни пропуски.\n\n" +
     "ТАБЛИЦА ФРАНШИЗ (CSV):\n" + (franchise ? franchise.slice(0, 12000) : "(недоступна)") +
     "\n\nРЕКВИЗИТЫ:\n" + requisites + "\n\nШАБЛОН ДОГОВОРА:\n" + CONTRACT_TEMPLATE +
     "\n\nВерни ТОЛЬКО полный заполненный текст договора, без пояснений и markdown.";
   const filled = await callClaude(prompt, 8000);
-  const lines = filled.split("\n");
-  const paras = lines.map(line => {
+  const paras = filled.split("\n").map(line => {
     const t = line.replace(/\s+$/, "");
     if (!t.trim()) return new Paragraph({ spacing: { after: 60 } });
     const isHead = /^\d+\.\s/.test(t.trim()) || /^[А-ЯЁ\s№".]{8,}$/.test(t.trim()) || /^(ЗАКАЗЧИК|ИСПОЛНИТЕЛЬ)/.test(t.trim());
@@ -354,18 +347,19 @@ async function buildContractDocx(requisites, price) {
 }
 
 const OFFER_KB = { reply_markup: { inline_keyboard: [
-  [{ text: "🎯 Подготовить КП (презентация)", callback_data: "kp" }],
+  [{ text: "📑 Результаты диагностики (PDF)", callback_data: "kp" }],
   [{ text: "📄 Подготовить договор", callback_data: "contract" }]
 ] } };
 
 const REQUISITES_GUIDE =
   "📄 Пришлите <b>реквизиты обеих сторон</b> одним сообщением. Шаблон:\n\n" +
-  "<b>ЗАКАЗЧИК (клиент):</b>\n• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Банковские реквизиты (банк, БИК, счёт IBAN):\n\n" +
-  "<b>ИСПОЛНИТЕЛЬ (вы):</b>\n• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Банковские реквизиты:\n\n" +
-  "• Ежемесячная цена (₸):\n\n(Номер договора франшизы подставлю автоматически по исполнителю. Скопируйте шаблон, заполните и отправьте.)";
+  "<b>Номер договора:</b>\n\n" +
+  "<b>ЗАКАЗЧИК (клиент):</b>\n• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Действует на основании (устав/свид-во):\n• Банковские реквизиты (банк, БИК, IBAN):\n\n" +
+  "<b>ИСПОЛНИТЕЛЬ (вы):</b>\n• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Действует на основании:\n• Банковские реквизиты:\n\n" +
+  "• Ежемесячная цена (₸):\n\n(Номер договора франшизы подставлю автоматически по исполнителю. Чего не хватит — я уточню перед выдачей.)";
 
 async function generateKp(chatId, transcript, priceOverride) {
-  const wait = await tg("sendMessage", { chat_id: chatId, text: "🎯 Готовлю индивидуальное КП…" });
+  const wait = await tg("sendMessage", { chat_id: chatId, text: "📑 Готовлю «Результаты диагностики»…" });
   try {
     const kp = await extractKp(transcript);
     if (priceOverride) kp.price = priceOverride.replace(/\D/g, "");
@@ -374,24 +368,43 @@ async function generateKp(chatId, transcript, priceOverride) {
       await send(chatId, "В диагностике не нашёл озвученную цену. Напишите ежемесячную цену, которую вы озвучили клиенту (например: 970000).");
       return;
     }
-    const buf = await buildKpPptx(kp, chatId);
-    await sendDocument(chatId, "Finpark_KP.pptx", buf, "Индивидуальное КП для: " + (kp.company || "клиента"));
+    const buf = await buildKpPdf(kp);
+    const fname = "Результаты диагностики Finpark - " + safeName(kp.company) + ".pdf";
+    await sendDocument(chatId, fname, buf, "Результаты диагностики для: " + (kp.company || "клиента"));
     if (state[chatId]) state[chatId].stage = "idle";
   } catch (e) {
-    await send(chatId, "⚠️ Не удалось собрать КП: " + esc(e.message || String(e)));
+    await send(chatId, "⚠️ Не удалось собрать документ: " + esc(e.message || String(e)));
   } finally { if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{}); }
 }
 
-async function generateContract(chatId, requisites) {
+async function generateContract(chatId) {
+  const st = state[chatId] || {};
   const wait = await tg("sendMessage", { chat_id: chatId, text: "📄 Готовлю договор…" });
   try {
-    const price = (state[chatId] && state[chatId].price) || null;
-    const buf = await buildContractDocx(requisites, price);
+    const buf = await buildContractDocx(st.creq || "", st.price || null);
     await sendDocument(chatId, "Finpark_Dogovor.docx", buf, "Договор готов. Проверьте реквизиты, номер франшизы и суммы перед подписанием.");
-    if (state[chatId]) state[chatId].stage = "idle";
+    state[chatId].stage = "idle";
   } catch (e) {
     await send(chatId, "⚠️ Не удалось собрать договор: " + esc(e.message || String(e)));
   } finally { if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{}); }
+}
+
+// после получения/дополнения реквизитов — проверяем пропуски
+async function processContractInfo(chatId) {
+  const st = state[chatId];
+  const pm = (st.creq || "").match(/(\d[\d  ]{3,})\s*(?:₸|тенге|тг)/i);
+  if (pm) st.price = pm[1].replace(/\D/g, "");
+  const wait = await tg("sendMessage", { chat_id: chatId, text: "🔎 Проверяю данные договора…" });
+  let qs = [];
+  try { qs = await contractMissing(st.creq, st.price); } catch {}
+  if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{});
+  st.rounds = (st.rounds || 0) + 1;
+  if (qs.length && st.rounds < 3) {
+    st.stage = "await_contract_followup";
+    await send(chatId, "Чтобы заполнить договор без прочерков, уточните:\n\n" + qs.map(q => "• " + esc(q)).join("\n") + "\n\nПришлите ответы одним сообщением. Или напишите <b>генерируй</b>, чтобы выпустить как есть.");
+  } else {
+    await generateContract(chatId);
+  }
 }
 
 async function handle(upd) {
@@ -403,7 +416,7 @@ async function handle(upd) {
       if (!st || !st.diagnostic) { await send(chatId, "Сначала пришлите диагностику для оценки."); return; }
       await generateKp(chatId, st.diagnostic);
     } else if (cq.data === "contract") {
-      state[chatId] = state[chatId] || {}; state[chatId].stage = "await_contract_requisites";
+      state[chatId] = state[chatId] || {}; state[chatId].stage = "await_contract_requisites"; state[chatId].rounds = 0;
       await send(chatId, REQUISITES_GUIDE);
     }
     return;
@@ -431,9 +444,12 @@ async function handle(upd) {
     let req = text;
     if (msg.document) { try { req = await readDocumentText(msg.document) || text; } catch {} }
     if (!req || req.length < 20) { await send(chatId, "Пришлите реквизиты текстом по шаблону."); return; }
-    const pm = req.match(/(\d[\d  ]{3,})\s*(?:₸|тенге|тг)/i);
-    state[chatId].price = pm ? pm[1].replace(/\D/g, "") : (st.price || null);
-    await generateContract(chatId, req); return;
+    st.creq = req; await processContractInfo(chatId); return;
+  }
+  if (st && st.stage === "await_contract_followup" && text) {
+    if (/^(генерируй|готово|выпускай|давай)/i.test(text)) { await generateContract(chatId); return; }
+    st.creq = (st.creq || "") + "\nДополнительно: " + text;
+    await processContractInfo(chatId); return;
   }
 
   let transcript = "";
@@ -465,7 +481,7 @@ async function handle(upd) {
 }
 
 async function main() {
-  console.log("Finpark bot v3 запущен. Модель:", MODEL, "| код доступа:", ACCESS_CODE ? "включён" : "выключен");
+  console.log("Finpark bot v4 запущен. Модель:", MODEL, "| код доступа:", ACCESS_CODE ? "включён" : "выключен");
   await tg("deleteWebhook", { drop_pending_updates: false }).catch(()=>{});
   let offset = 0;
   while (true) {
