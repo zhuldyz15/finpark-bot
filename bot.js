@@ -112,14 +112,28 @@ async function callClaude(prompt, maxTokens) {
 }
 function parseJson(text) { const a = text.indexOf("{"), b = text.lastIndexOf("}"); return JSON.parse(text.slice(a, b + 1)); }
 
+const ROP_METHOD =
+  "СТИЛЬ РАЗБОРА (как у РОПа Finpark): критикуй прямо, по делу и доказательно — опираясь на конкретные реплики и пропуски в ЭТОМ диалоге, без общих фраз. " +
+  "Принципы, которые проверяй жёстко: " +
+  "(1) Связь вопрос→презентация: каждый заданный вопрос должен быть отыгран в презентации; лишние вопросы порождают у клиента новые незакрытые вопросы. " +
+  "(2) Раскрутка: к базовым вопросам нужны уточняющие; выявить потребности за <10 вопросов невозможно. " +
+  "(3) В начале обязателен блок «с кем советоваться/кто принимает решение» — иначе возражение всплывёт в конце. " +
+  "(4) Адженда: проговорить цели обеих сторон и вовлечь клиента, держать ценность встречи (не заискивать, не обесценивать). " +
+  "(5) Не выдумывать потребность за клиента — фиксировать только реально сказанное; если цель «рост прибыли» — уточнить «от скольки до скольки». " +
+  "(6) Презентация адресная под собранные задачи, а не «как вебинар». " +
+  "(7) Отработка возражений = возврат к задаче клиента и показ, как продукт её закрывает; на «дорого» спросить «это единственное, что останавливает? на какую сумму ориентировались?». " +
+  "(8) Закрытие через фиксацию (предоплата/меньший шаг — финмодель), а не «уходите подумайте». " +
+  "(9) Всё взаимосвязано: слабый старт бьёт в финале. Мышление — чистая прибыль, не оборот. ";
+
 async function evaluateText(transcript) {
   const prompt =
-    "Ты — методолог отдела продаж Finpark (финдиректор на аутсорсе). Оцени ТЕКСТ ДИАГНОСТИКИ строго по критериям. " +
-    "Для КАЖДОГО пункта поставь балл: 2 если выполнен в полном объёме, 1 если частично/поверхностно, 0 если не выполнено или отсутствует. " +
-    "Оценивай ТОЛЬКО по тому, что реально есть в тексте. Дай также 3 сильные стороны и 1 короткое резюме.\n\nКРИТЕРИИ:\n" + CRITERIA +
+    "Ты — РОП (руководитель отдела продаж) Finpark. Разбери ТЕКСТ ДИАГНОСТИКИ как наставник партнёра-франчайзи, строго по чек-листу. " + ROP_METHOD +
+    "\nЗадачи: 1) Для КАЖДОГО пункта чек-листа поставь балл 0/1/2 (2 — выполнено полно, 1 — частично, 0 — нет/отсутствует), оценивая ТОЛЬКО по фактам из текста. " +
+    "2) По КАЖДОМУ из 8 этапов вскрой КОНКРЕТНЫЕ ошибки (с привязкой к реальным репликам/пропускам этого диалога) и дай «как надо было» — с примером точной формулировки или вопроса. " +
+    "3) Дай 3 сильные стороны и короткое резюме-вердикт.\n\nКРИТЕРИИ (этапы и пункты):\n" + CRITERIA +
     "\n\nТЕКСТ ДИАГНОСТИКИ:\n" + transcript.slice(0, 60000) +
-    '\n\nВерни СТРОГО валидный JSON без markdown: {"scores":{"1.1":{"s":2,"n":"кратко"}, ... все коды ...},"strengths":["..","..",".."],"summary":".."}';
-  return parseJson(await callClaude(prompt));
+    '\n\nВерни СТРОГО валидный JSON без markdown: {"scores":{"1.1":{"s":2,"n":"кратко"}, ...все коды...},"stages":{"1":{"mistakes":["конкретная ошибка по факту диалога"],"howto":["что и как сделать + пример фразы/вопроса"]}, ..."8":{...}},"strengths":["..","..",".."],"summary":"вердикт"}';
+  return parseJson(await callClaude(prompt, 6000));
 }
 
 function buildReport(p) {
@@ -138,7 +152,18 @@ function buildReport(p) {
   for (const st of stages) t += dot(st.pct) + " " + st.code + ". " + esc(st.name) + " — <b>" + Math.round(st.pct*100) + "%</b> <i>(вес " + st.weight + "%)</i>\n";
   t += "\n<b>💪 Сильные стороны:</b>\n" + ((p.strengths||[]).map(s => "• " + esc(s)).join("\n") || "—") + "\n";
   t += "\n<b>📈 Приоритетные точки роста:</b>\n" + (growth.map(g => dot(g.pct) + " Этап " + g.code + ". " + esc(g.name) + " (" + Math.round(g.pct*100) + "%)").join("\n") || "Все этапы в норме 🟢") + "\n";
-  if (growth.length) { t += "\n<b>🛠 Рекомендации:</b>\n"; for (const g of growth) t += "<b>Этап " + g.code + ". " + esc(g.name) + "</b>\n" + (TIPS[g.code]||[]).map(x => "• " + esc(x)).join("\n") + "\n"; }
+  if (growth.length) {
+    t += "\n<b>🛠 Что усилить (конкретно):</b>\n";
+    for (const g of growth) {
+      const sd = (p.stages && p.stages[g.code]) || {};
+      const ms = (sd.mistakes || []).slice(0, 2), hw = (sd.howto || []).slice(0, 1);
+      t += "<b>Этап " + g.code + ". " + esc(g.name) + "</b>\n";
+      ms.forEach(m => t += "✗ " + esc(m) + "\n");
+      hw.forEach(h => t += "→ " + esc(h) + "\n");
+      if (!ms.length && !hw.length) (TIPS[g.code] || []).slice(0, 1).forEach(x => t += "• " + esc(x) + "\n");
+    }
+    t += "\n<i>Полный разбор с примерами «как надо» — кнопка «Детальный разбор (PDF)».</i>";
+  }
   return t;
 }
 
@@ -304,6 +329,52 @@ function buildKpPdf(kp) {
   });
 }
 
+// ---------- Детальный разбор для франчайзи (PDF) ----------
+function buildEvalPdf(p) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: "A4", margins: { top: 55, bottom: 60, left: 55, right: 55 }, bufferPages: true });
+    doc.registerFont("R", FONT_R); doc.registerFont("B", FONT_B);
+    const chunks = []; doc.on("data", c => chunks.push(c)); doc.on("end", () => resolve(Buffer.concat(chunks))); doc.on("error", reject);
+    const M = 55, PW = doc.page.width, CW = PW - 2 * M, BOT = () => doc.page.height - 60;
+    const ensure = h => { if (doc.y + h > BOT()) doc.addPage(); };
+    const colOf = pct => pct >= 0.8 ? GREEN : pct >= 0.5 ? "#BF8F00" : "#C00000";
+    const stWord = pct => pct >= 0.8 ? "норма" : pct >= 0.5 ? "зона роста" : "провал";
+    const H = (t, fill) => { ensure(44); const y = doc.y; doc.roundedRect(M, y, CW, 26, 4).fill(fill || NAVY); doc.fillColor("#FFFFFF").font("B").fontSize(12).text(t, M + 12, y + 6, { width: CW - 24 }); doc.y = y + 26; doc.moveDown(0.4); doc.fillColor("#000000"); };
+    const P = (t, o = {}) => { doc.font(o.b ? "B" : "R").fontSize(o.fs || 10.5).fillColor(o.color || "#222222"); ensure(doc.heightOfString(t, { width: CW }) + 3); doc.text(t, M, doc.y, { width: CW, paragraphGap: o.gap == null ? 3 : o.gap }); };
+    const item = (mark, color, t) => { doc.font("R").fontSize(10.5); const hh = doc.heightOfString(t, { width: CW - 18 }); ensure(hh + 3); const y = doc.y; doc.font("B").fillColor(color).text(mark, M, y, { width: 14 }); doc.font("R").fillColor("#222222").text(t, M + 16, y, { width: CW - 16, paragraphGap: 4 }); };
+    const stLine = s => { ensure(16); const y = doc.y; doc.font("B").fillColor(colOf(s.pct)).fontSize(11).text("●", M, y, { width: 12 }); doc.font("R").fillColor("#222222").fontSize(10.5).text("Этап " + s.code + ". " + s.name + " — " + Math.round(s.pct * 100) + "% (вес " + s.weight + "%)", M + 16, y, { width: CW - 16 }); };
+
+    const sc = p.scores || {}; let itog = 0; const stages = [];
+    for (const s of RUBRIC) { let sum = 0; for (const it of s.items) { let v = sc[it.c] && typeof sc[it.c].s === "number" ? sc[it.c].s : 0; v = Math.max(0, Math.min(2, Math.round(v))); sum += v; } const pct = sum / (s.items.length * 2); itog += pct * (s.weight / 100); stages.push({ code: s.code, name: s.name, weight: s.weight, pct }); }
+    const stat = itog >= 0.9 ? "Эталон" : itog >= 0.75 ? "Хорошо" : itog >= 0.5 ? "Рабочий уровень" : "Критично";
+
+    doc.rect(0, 0, PW, doc.page.height).fill(NAVY);
+    doc.fillColor("#FFFFFF").font("B").fontSize(20).text("FINPARK", M, 90, { characterSpacing: 3 });
+    doc.font("B").fontSize(32).text("Разбор диагностики", M, 250, { width: CW });
+    doc.font("R").fontSize(15).fillColor("#BCD3EE").text("Внутренний разбор для партнёра-франчайзи", M, 315, { width: CW });
+    doc.font("B").fontSize(40).fillColor("#FFFFFF").text(Math.round(itog * 100) + "% · " + stat, M, 385);
+    doc.font("R").fontSize(11).fillColor("#9FB6D6").text(new Date().toLocaleDateString("ru-RU"), M, doc.page.height - 90);
+    doc.addPage(); doc.fillColor("#000000");
+
+    H("Итог по этапам");
+    stages.forEach(stLine);
+    doc.moveDown(0.4);
+    if (p.summary) { H("Вердикт"); P(p.summary); doc.moveDown(0.2); }
+    if (p.strengths && p.strengths.length) { H("Сильные стороны"); p.strengths.forEach(x => item("✓", GREEN, x)); doc.moveDown(0.2); }
+
+    stages.forEach(s => {
+      const sd = (p.stages && p.stages[s.code]) || {};
+      H("Этап " + s.code + ". " + s.name + "  —  " + Math.round(s.pct * 100) + "% · " + stWord(s.pct), colOf(s.pct) === GREEN ? "#3F6B27" : colOf(s.pct) === "#C00000" ? "#8A1B1B" : "#8A6A00");
+      if ((sd.mistakes || []).length) { P("Ошибки:", { b: true, color: "#A01B1B" }); (sd.mistakes || []).forEach(m => item("✗", "#C00000", m)); }
+      else P("Серьёзных ошибок не выявлено.", { color: GREYT });
+      if ((sd.howto || []).length) { doc.moveDown(0.15); P("Как надо было:", { b: true, color: NAVY }); (sd.howto || []).forEach(h => item("→", BLUE, h)); }
+      doc.moveDown(0.3);
+    });
+
+    doc.end();
+  });
+}
+
 // ---------- Договор ----------
 async function contractMissing(requisites, price) {
   const franchise = await getFranchiseCsv();
@@ -347,7 +418,8 @@ async function buildContractDocx(requisites, price) {
 }
 
 const OFFER_KB = { reply_markup: { inline_keyboard: [
-  [{ text: "📑 Результаты диагностики (PDF)", callback_data: "kp" }],
+  [{ text: "🧑‍🏫 Детальный разбор для партнёра (PDF)", callback_data: "eval" }],
+  [{ text: "📑 Результаты диагностики для клиента (PDF)", callback_data: "kp" }],
   [{ text: "📄 Подготовить договор", callback_data: "contract" }]
 ] } };
 
@@ -374,6 +446,18 @@ async function generateKp(chatId, transcript, priceOverride) {
     if (state[chatId]) state[chatId].stage = "idle";
   } catch (e) {
     await send(chatId, "⚠️ Не удалось собрать документ: " + esc(e.message || String(e)));
+  } finally { if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{}); }
+}
+
+async function generateEvalPdf(chatId) {
+  const st = state[chatId];
+  if (!st || !st.analysis) { await send(chatId, "Сначала пришлите диагностику для оценки."); return; }
+  const wait = await tg("sendMessage", { chat_id: chatId, text: "🧑‍🏫 Готовлю детальный разбор…" });
+  try {
+    const buf = await buildEvalPdf(st.analysis);
+    await sendDocument(chatId, "Разбор диагностики Finpark.pdf", buf, "Детальный разбор для партнёра: ошибки по этапам и как надо было.");
+  } catch (e) {
+    await send(chatId, "⚠️ Не удалось собрать разбор: " + esc(e.message || String(e)));
   } finally { if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{}); }
 }
 
@@ -412,7 +496,9 @@ async function handle(upd) {
     const cq = upd.callback_query; const chatId = cq.message.chat.id;
     tg("answerCallbackQuery", { callback_query_id: cq.id }).catch(()=>{});
     const st = state[chatId];
-    if (cq.data === "kp") {
+    if (cq.data === "eval") {
+      await generateEvalPdf(chatId);
+    } else if (cq.data === "kp") {
       if (!st || !st.diagnostic) { await send(chatId, "Сначала пришлите диагностику для оценки."); return; }
       await generateKp(chatId, st.diagnostic);
     } else if (cq.data === "contract") {
@@ -472,7 +558,7 @@ async function handle(upd) {
   const wait = await tg("sendMessage", { chat_id: chatId, text: "⏳ Анализирую диагностику по 38 критериям…" });
   try {
     const parsed = await evaluateText(transcript);
-    state[chatId] = { stage: "idle", diagnostic: transcript };
+    state[chatId] = { stage: "idle", diagnostic: transcript, analysis: parsed };
     await send(chatId, buildReport(parsed));
     await send(chatId, "Нужно подготовить документы по этому клиенту?", OFFER_KB);
   } catch (e) {
