@@ -126,23 +126,36 @@ const ROP_METHOD =
   "(8) Закрытие через фиксацию (предоплата/меньший шаг — финмодель), а не «уходите подумайте». " +
   "(9) Всё взаимосвязано: слабый старт бьёт в финале. Мышление — чистая прибыль, не оборот. ";
 
+const REC_NOTE = "ВАЖНО: пункт 1.1 (встреча на записи) ВСЕГДА считай выполненным (балл 2) — раз есть текст диагностики, запись велась; не считай это ошибкой и не упоминай в разборе. ";
+
 async function evaluateText(transcript) {
   const tx = transcript.slice(0, 55000);
   const rich =
-    "Ты — РОП (руководитель отдела продаж) Finpark. Разбери ТЕКСТ ДИАГНОСТИКИ как наставник партнёра-франчайзи, строго по чек-листу. " + ROP_METHOD +
+    "Ты — РОП (руководитель отдела продаж) Finpark. Разбери ТЕКСТ ДИАГНОСТИКИ как наставник партнёра-франчайзи, строго по чек-листу. " + ROP_METHOD + REC_NOTE +
     "\nЗадачи: 1) Для КАЖДОГО пункта чек-листа поставь балл 0/1/2 (2 — полно, 1 — частично, 0 — нет/отсутствует), ТОЛЬКО по фактам из текста. " +
     "2) По КАЖДОМУ из 8 этапов: до 2 КОНКРЕТНЫХ ошибок (по реальным репликам/пропускам диалога, коротко) и до 2 «как надо было» (с примером формулировки/вопроса, коротко). " +
     "3) Дай 3 сильные стороны и короткий вердикт.\n\nКРИТЕРИИ:\n" + CRITERIA +
     "\n\nТЕКСТ ДИАГНОСТИКИ:\n" + tx +
     '\n\nВерни СТРОГО валидный JSON без markdown и без лишнего текста. Баллы — числами. Формат: {"scores":{"1.1":2,"1.2":1, ...все коды...},"stages":{"1":{"mistakes":["..."],"howto":["..."]}, ..."8":{...}},"strengths":["..","..",".."],"summary":"вердикт"}';
-  try { return parseJson(await callClaude(rich, 8000)); }
+  let res;
+  try { res = parseJson(await callClaude(rich, 8000)); }
   catch (e) {
     const lite =
-      "Оцени ТЕКСТ ДИАГНОСТИКИ по чек-листу Finpark. Для каждого пункта балл 0/1/2 по фактам из текста. Дай 3 сильные стороны и короткий вердикт.\n\nКРИТЕРИИ:\n" + CRITERIA +
+      "Оцени ТЕКСТ ДИАГНОСТИКИ по чек-листу Finpark. Для каждого пункта балл 0/1/2 по фактам из текста. " + REC_NOTE + "Дай 3 сильные стороны и короткий вердикт.\n\nКРИТЕРИИ:\n" + CRITERIA +
       "\n\nТЕКСТ:\n" + tx +
       '\n\nВерни СТРОГО JSON без markdown: {"scores":{"1.1":2, ...все коды...},"strengths":["..","..",".."],"summary":".."}';
-    return parseJson(await callClaude(lite, 3000));
+    res = parseJson(await callClaude(lite, 3000));
   }
+  if (res && res.scores) res.scores["1.1"] = 2; // запись велась — раз есть текст
+  return res;
+}
+
+async function extractPrice(transcript) {
+  try {
+    const t = await callClaude("Найди в тексте диагностики ежемесячную цену (тенге), которую партнёр озвучил клиенту. Верни ТОЛЬКО число без пробелов и символов (например 970000). Если цены нет — верни 0.\n\nТЕКСТ:\n" + transcript.slice(0, 55000), 30);
+    const n = (t.match(/\d[\d\s ]{3,}/) || [""])[0].replace(/\D/g, "");
+    return n && n.length >= 4 ? n : null;
+  } catch { return null; }
 }
 
 function buildReport(p) {
@@ -389,8 +402,8 @@ async function contractMissing(requisites, price) {
   const franchise = await getFranchiseCsv();
   const prompt =
     "Проверь, достаточно ли данных, чтобы заполнить договор оказания услуг БЕЗ ПРОЧЕРКОВ. " +
-    "Обязательные поля: номер договора; по ЗАКАЗЧИКУ и по ИСПОЛНИТЕЛЮ — наименование/ИП, БИН/ИИН, юр.адрес, в лице (ФИО+должность), основание (устав/свидетельство/доверенность), банковские реквизиты; ежемесячная цена; номер и дата договора франшизы исполнителя (его нужно взять из таблицы франшиз по наименованию/БИН/ФИО исполнителя). " +
-    "Цена сейчас: " + (price || "не указана") + ". " +
+    "Обязательные поля: номер договора; по ЗАКАЗЧИКУ и по ИСПОЛНИТЕЛЮ — наименование/ИП, БИН/ИИН, юр.адрес, в лице (ФИО+должность), основание (устав/свидетельство/доверенность), банковские реквизиты; номер и дата договора франшизы исполнителя (его нужно взять из таблицы франшиз по наименованию/БИН/ФИО исполнителя). " +
+    "ЦЕНУ НЕ спрашивай — она берётся из диагностики (сейчас: " + (price || "не указана") + "). " +
     "Сопоставь РЕКВИЗИТЫ с обязательными полями и верни список того, чего НЕ ХВАТАЕТ, короткими вопросами на русском. Если франшиза исполнителя не найдена в таблице — добавь вопрос про номер и дату договора франшизы.\n\n" +
     "ТАБЛИЦА ФРАНШИЗ (CSV):\n" + (franchise ? franchise.slice(0, 12000) : "(недоступна)") +
     "\n\nРЕКВИЗИТЫ:\n" + requisites +
@@ -432,12 +445,13 @@ const OFFER_KB = { reply_markup: { inline_keyboard: [
   [{ text: "📄 Подготовить договор", callback_data: "contract" }]
 ] } };
 
-const REQUISITES_GUIDE =
-  "📄 Пришлите <b>реквизиты обеих сторон</b> одним сообщением. Шаблон:\n\n" +
-  "<b>Номер договора:</b>\n\n" +
-  "<b>ЗАКАЗЧИК (клиент):</b>\n• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Действует на основании (устав/свид-во):\n• Банковские реквизиты (банк, БИК, IBAN):\n\n" +
-  "<b>ИСПОЛНИТЕЛЬ (вы):</b>\n• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Действует на основании:\n• Банковские реквизиты:\n\n" +
-  "• Ежемесячная цена (₸):\n\n(Номер договора франшизы подставлю автоматически по исполнителю. Чего не хватит — я уточню перед выдачей.)";
+const GUIDE_ZAKAZCHIK =
+  "📄 Шаг 1 из 2 — реквизиты <b>ЗАКАЗЧИКА (клиента)</b>. Пришлите одним сообщением:\n\n" +
+  "• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Действует на основании (устав/свид-во):\n• Банковские реквизиты (банк, БИК, IBAN):";
+const GUIDE_ISPOLNITEL =
+  "📄 Шаг 2 из 2 — реквизиты <b>ИСПОЛНИТЕЛЯ (вас)</b>. Пришлите одним сообщением:\n\n" +
+  "• Наименование / ИП:\n• БИН/ИИН:\n• Юр. адрес:\n• В лице (ФИО, должность):\n• Действует на основании:\n• Банковские реквизиты:\n\n" +
+  "(Сумму договора возьму из диагностики, номер договора франшизы — из таблицы по вам. Чего не хватит — спрошу отдельными сообщениями.)";
 
 async function generateKp(chatId, transcript, priceOverride) {
   const wait = await tg("sendMessage", { chat_id: chatId, text: "📑 Готовлю «Результаты диагностики»…" });
@@ -482,19 +496,25 @@ async function generateContract(chatId) {
   } finally { if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{}); }
 }
 
-// после получения/дополнения реквизитов — проверяем пропуски
+function buildCreq(st) {
+  return "ЗАКАЗЧИК (клиент):\n" + (st.zakazchik || "") +
+    "\n\nИСПОЛНИТЕЛЬ (партнёр):\n" + (st.ispolnitel || "") +
+    "\n\nЕжемесячная цена (из диагностики): " + (st.price ? st.price + " тенге" : "не определена") +
+    (st.followups ? "\n\nДополнительно от партнёра:\n" + st.followups : "");
+}
+
+// после сбора реквизитов — проверяем, чего не хватает, и докручиваем отдельными сообщениями
 async function processContractInfo(chatId) {
   const st = state[chatId];
-  const pm = (st.creq || "").match(/(\d[\d  ]{3,})\s*(?:₸|тенге|тг)/i);
-  if (pm) st.price = pm[1].replace(/\D/g, "");
+  st.creq = buildCreq(st);
   const wait = await tg("sendMessage", { chat_id: chatId, text: "🔎 Проверяю данные договора…" });
   let qs = [];
   try { qs = await contractMissing(st.creq, st.price); } catch {}
   if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{});
   st.rounds = (st.rounds || 0) + 1;
-  if (qs.length && st.rounds < 3) {
+  if (qs.length && st.rounds < 4) {
     st.stage = "await_contract_followup";
-    await send(chatId, "Чтобы заполнить договор без прочерков, уточните:\n\n" + qs.map(q => "• " + esc(q)).join("\n") + "\n\nПришлите ответы одним сообщением. Или напишите <b>генерируй</b>, чтобы выпустить как есть.");
+    await send(chatId, "Ещё нужно уточнить — ответьте следующими сообщениями:\n\n" + qs.map(q => "• " + esc(q)).join("\n") + "\n\nИли напишите <b>генерируй</b>, чтобы выпустить как есть.");
   } else {
     await generateContract(chatId);
   }
@@ -511,8 +531,10 @@ async function handle(upd) {
       if (!st || !st.diagnostic) { await send(chatId, "Сначала пришлите диагностику для оценки."); return; }
       await generateKp(chatId, st.diagnostic);
     } else if (cq.data === "contract") {
-      state[chatId] = state[chatId] || {}; state[chatId].stage = "await_contract_requisites"; state[chatId].rounds = 0;
-      await send(chatId, REQUISITES_GUIDE);
+      const s2 = state[chatId] = state[chatId] || {};
+      s2.stage = "await_zakazchik"; s2.rounds = 0; s2.zakazchik = null; s2.ispolnitel = null; s2.followups = "";
+      if (!s2.price && s2.diagnostic) { try { s2.price = await extractPrice(s2.diagnostic); } catch {} }
+      await send(chatId, GUIDE_ZAKAZCHIK);
     }
     return;
   }
@@ -535,15 +557,22 @@ async function handle(upd) {
     if (price.length < 4) { await send(chatId, "Похоже, это не сумма. Напишите цену цифрами, например: 970000."); return; }
     st.price = price; await generateKp(chatId, st.diagnostic, price); return;
   }
-  if (st && st.stage === "await_contract_requisites" && (text || msg.document)) {
+  if (st && st.stage === "await_zakazchik" && (text || msg.document)) {
     let req = text;
     if (msg.document) { try { req = await readDocumentText(msg.document) || text; } catch {} }
-    if (!req || req.length < 20) { await send(chatId, "Пришлите реквизиты текстом по шаблону."); return; }
-    st.creq = req; await processContractInfo(chatId); return;
+    if (!req || req.length < 8) { await send(chatId, "Пришлите реквизиты заказчика текстом."); return; }
+    st.zakazchik = req; st.stage = "await_ispolnitel";
+    await send(chatId, GUIDE_ISPOLNITEL); return;
+  }
+  if (st && st.stage === "await_ispolnitel" && (text || msg.document)) {
+    let req = text;
+    if (msg.document) { try { req = await readDocumentText(msg.document) || text; } catch {} }
+    if (!req || req.length < 8) { await send(chatId, "Пришлите реквизиты исполнителя текстом."); return; }
+    st.ispolnitel = req; await processContractInfo(chatId); return;
   }
   if (st && st.stage === "await_contract_followup" && text) {
     if (/^(генерируй|готово|выпускай|давай)/i.test(text)) { await generateContract(chatId); return; }
-    st.creq = (st.creq || "") + "\nДополнительно: " + text;
+    st.followups = (st.followups || "") + (st.followups ? "\n" : "") + text;
     await processContractInfo(chatId); return;
   }
 
