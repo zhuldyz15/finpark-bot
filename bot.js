@@ -19,6 +19,8 @@ const TOKEN = process.env.BOT_TOKEN;
 const KEY = process.env.ANTHROPIC_API_KEY;
 const ACCESS_CODE = (process.env.ACCESS_CODE || "").trim();
 const MODEL = process.env.MODEL || "claude-haiku-4-5-20251001";
+const ADMIN_CHAT_ID = (process.env.ADMIN_CHAT_ID || "").trim();
+const SHEET_WEBHOOK_URL = (process.env.SHEET_WEBHOOK_URL || "").trim();
 const FRANCHISE_CSV_URL = "https://docs.google.com/spreadsheets/d/1Kt0MZJfzcBxLre4tqR266hGs5yRlLYDDTb0yU28oKEA/export?format=csv";
 if (!TOKEN) { console.error("Нет BOT_TOKEN"); process.exit(1); }
 if (!KEY) { console.error("Нет ANTHROPIC_API_KEY"); process.exit(1); }
@@ -187,6 +189,26 @@ function buildReport(p) {
     t += "\n<i>Полный разбор с примерами «как надо» — кнопка «Детальный разбор (PDF)».</i>";
   }
   return t;
+}
+
+function computeItog(scores) {
+  const sc = scores || {}; let itog = 0;
+  for (const s of RUBRIC) { let sum = 0; for (const it of s.items) sum += Math.max(0, Math.min(2, Math.round(sval(sc[it.c])))); itog += (sum / (s.items.length * 2)) * (s.weight / 100); }
+  return Math.round(itog * 100);
+}
+async function logEvaluation(msg, transcript, parsed) {
+  const pct = computeItog(parsed.scores);
+  const from = msg.from || {};
+  const partner = ((from.first_name || "") + " " + (from.last_name || "")).trim() + (from.username ? " @" + from.username : "");
+  const date = new Date().toISOString().replace("T", " ").slice(0, 16);
+  const snippet = String(transcript).replace(/\s+/g, " ").slice(0, 180);
+  if (ADMIN_CHAT_ID) {
+    tg("sendMessage", { chat_id: ADMIN_CHAT_ID, parse_mode: "HTML", disable_web_page_preview: true,
+      text: "🗒 <b>Новая оценка</b>\nПартнёр: " + esc(partner || String(msg.chat.id)) + "\nchat_id: " + msg.chat.id + "\nДата: " + date + "\nИтог: <b>" + pct + "%</b>\nНачало: <i>" + esc(snippet) + "…</i>" }).catch(()=>{});
+  }
+  if (SHEET_WEBHOOK_URL) {
+    fetch(SHEET_WEBHOOK_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ date, partner, chatId: String(msg.chat.id), score: pct, snippet }) }).catch(()=>{});
+  }
 }
 
 // ---------- извлечение данных для документа ----------
@@ -544,6 +566,7 @@ async function handle(upd) {
   const text = (msg.text || "").trim();
 
   if (text === "/start") { state[chatId] = { stage: "idle" }; await send(chatId, WELCOME); if (ACCESS_CODE) await send(chatId, "🔒 Доступ по коду. Пришлите кодовое слово, чтобы начать."); return; }
+  if (text === "/id") { await send(chatId, "Ваш chat_id: <code>" + chatId + "</code>\nВпишите его в переменную <b>ADMIN_CHAT_ID</b> в Railway, чтобы получать копии оценок."); return; }
 
   if (ACCESS_CODE && !allowed.has(chatId)) {
     if (text === ACCESS_CODE) { allowed.add(chatId); await send(chatId, "✅ Доступ открыт. Пришлите диагностику текстом, ссылкой или файлом."); }
@@ -599,6 +622,7 @@ async function handle(upd) {
     state[chatId] = { stage: "idle", diagnostic: transcript, analysis: parsed };
     await send(chatId, buildReport(parsed));
     await send(chatId, "Нужно подготовить документы по этому клиенту?", OFFER_KB);
+    logEvaluation(msg, transcript, parsed).catch(()=>{});
   } catch (e) {
     await send(chatId, "⚠️ Ошибка оценки: " + esc(e.message || String(e)));
   } finally { if (wait.ok) tg("deleteMessage", { chat_id: chatId, message_id: wait.result.message_id }).catch(()=>{}); }
